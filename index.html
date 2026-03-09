@@ -22,10 +22,9 @@
 <script type="text/babel">
 
 // ─── CONFIG — Replace these with your actual keys ─────────────────────────────
-const SUPABASE_URL     = "caoemavwgpipqbfccuhh.supabase.co";
-const SUPABASE_ANON_KEY= "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNhb2VtYXZ3Z3BpcHFiZmNjdWhoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjAyNDgsImV4cCI6MjA4ODYzNjI0OH0.noF4r0ZrAUGPVZeRLcDzcNJj4ECr-f-js2XWwEggLa4
-";
-const ANTHROPIC_KEY    = "YOUR_ANTHROPIC_API_KEY";
+const SUPABASE_URL     = "https://caoemavwgpipqbfccuhh.supabase.co";
+const SUPABASE_ANON_KEY= "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNhb2VtYXZ3Z3BpcHFiZmNjdWhoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjAyNDgsImV4cCI6MjA4ODYzNjI0OH0.noF4r0ZrAUGPVZeRLcDzcNJj4ECr-f-js2XWwEggLa4";
+const GEMINI_KEY       = "AIzaSyDWW2bGe62bvfC8dsg79Wzt_Q8UU9IPrIs";  // Free at aistudio.google.com
 
 // ─── Supabase client ──────────────────────────────────────────────────────────
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -101,16 +100,21 @@ const db = {
   }
 };
 
-// ─── AI Helpers ───────────────────────────────────────────────────────────────
-async function callClaude(messages, maxTokens=3000) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+// ─── AI Helpers (Google Gemini — Free) ───────────────────────────────────────
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
+
+async function callGemini(parts, maxTokens=3000) {
+  const res = await fetch(GEMINI_URL, {
     method:"POST",
-    headers:{"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-    body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:maxTokens,messages})
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      contents:[{parts}],
+      generationConfig:{maxOutputTokens:maxTokens,temperature:0.7}
+    })
   });
   const data = await res.json();
   if(data.error) throw new Error(data.error.message);
-  return data.content.map(i=>i.text||"").join("");
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
 }
 
 async function fileToBase64(file) {
@@ -123,47 +127,51 @@ async function fileToBase64(file) {
 }
 
 async function extractPDFPages(file, pageSpec) {
-  const base64=await fileToBase64(file);
-  const prompt=pageSpec
-    ?`Extract text ONLY from pages ${pageSpec} of this PDF. Return plain text only.`
-    :`Extract ALL readable text. Return plain text only.`;
-  return callClaude([{role:"user",content:[
-    {type:"document",source:{type:"base64",media_type:"application/pdf",data:base64}},
-    {type:"text",text:prompt}
-  ]}],4000);
+  const base64 = await fileToBase64(file);
+  const prompt = pageSpec
+    ? `Extract text ONLY from pages ${pageSpec} of this PDF. Return plain text only, no formatting.`
+    : `Extract ALL readable text from this PDF. Return plain text only.`;
+  return callGemini([
+    {inline_data:{mime_type:"application/pdf", data:base64}},
+    {text: prompt}
+  ], 4000);
 }
 
 async function extractImageText(file) {
-  const base64=await fileToBase64(file);
-  const mt=file.type||"image/jpeg";
-  return callClaude([{role:"user",content:[
-    {type:"image",source:{type:"base64",media_type:mt,data:base64}},
-    {type:"text",text:"Extract ALL readable text from this image. Return plain text only."}
-  ]}],3000);
+  const base64 = await fileToBase64(file);
+  const mt = file.type || "image/jpeg";
+  return callGemini([
+    {inline_data:{mime_type:mt, data:base64}},
+    {text:"Extract ALL readable text from this image. Return plain text only."}
+  ], 3000);
 }
 
-async function extractKeywords(text,count=15) {
-  const raw=await callClaude([{role:"user",content:`From this English text, extract the ${count} most important vocabulary words for an English learner.
+async function extractKeywords(text, count=15) {
+  const raw = await callGemini([{text:
+    `From this English text, extract the ${count} most important vocabulary words for an English learner.
 Text: ${text}
-Respond ONLY with a JSON array: [{"word":"...","definition":"...","partOfSpeech":"..."}]
-No markdown, no explanation.`}]);
-  const m=raw.match(/\[[\s\S]*\]/);if(!m)throw new Error("No JSON");
+Respond ONLY with a JSON array, no markdown, no backticks:
+[{"word":"...","definition":"...","partOfSpeech":"..."}]`
+  }]);
+  const m = raw.match(/\[[\s\S]*\]/); if(!m) throw new Error("No JSON");
   return JSON.parse(m[0]);
 }
 
-async function generateQuizFromText(text,quizType,count) {
+async function generateQuizFromText(text, quizType, count) {
   const typeMap={
-    vocabulary:"Generate ONLY vocabulary MCQs testing word meaning or definition.",
-    prepositions:"Generate ONLY preposition MCQs — sentences with a blank for a preposition.",
-    fill_blank:"Generate ONLY fill-in-the-blank MCQs — sentences with one word missing.",
-    mix:"Generate a balanced mix of vocabulary, preposition, and fill-in-the-blank questions."
+    vocabulary:   "Generate ONLY vocabulary MCQs testing word meaning or definition.",
+    prepositions: "Generate ONLY preposition MCQs — sentences with a blank for a preposition.",
+    fill_blank:   "Generate ONLY fill-in-the-blank MCQs — sentences with one word missing.",
+    mix:          "Generate a balanced mix of vocabulary, preposition, and fill-in-the-blank questions."
   };
-  const raw=await callClaude([{role:"user",content:`You are an English teacher. Generate exactly ${count} MCQs.
+  const raw = await callGemini([{text:
+    `You are an English teacher. Generate exactly ${count} MCQs.
 Type: ${typeMap[quizType]||typeMap.mix}
 Text: ${text.slice(0,6000)}
-Respond ONLY with a valid JSON array, no markdown:
-[{"question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"answer":"A","type":"vocabulary"}]`}],4000);
-  const m=raw.match(/\[[\s\S]*\]/);if(!m)throw new Error("No JSON");
+Respond ONLY with a valid JSON array, no markdown, no backticks:
+[{"question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"answer":"A","type":"vocabulary"}]`
+  }], 4000);
+  const m = raw.match(/\[[\s\S]*\]/); if(!m) throw new Error("No JSON in response");
   return JSON.parse(m[0]);
 }
 
