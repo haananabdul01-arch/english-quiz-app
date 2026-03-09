@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>English Quiz App</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,sans-serif;background:#f8fafc}
+  input,select,textarea,button{font-family:inherit}
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-track{background:#f1f5f9}
+  ::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+// ─── CONFIG — Replace these with your actual keys ─────────────────────────────
+const SUPABASE_URL     = "YOUR_SUPABASE_URL";
+const SUPABASE_ANON_KEY= "YOUR_SUPABASE_ANON_KEY";
+const ANTHROPIC_KEY    = "YOUR_ANTHROPIC_API_KEY";
+
+// ─── Supabase client ──────────────────────────────────────────────────────────
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ─── DB helpers ───────────────────────────────────────────────────────────────
+const db = {
+  async getStudents() {
+    const {data,error} = await supabase.from("students").select("*").order("created_at");
+    if(error) throw error; return data||[];
+  },
+  async saveStudent(s) {
+    const {error} = await supabase.from("students").upsert({id:s.id,name:s.name,username:s.username,password:s.password,email:s.email||""});
+    if(error) throw error;
+  },
+  async deleteStudent(id) {
+    const {error} = await supabase.from("students").delete().eq("id",id);
+    if(error) throw error;
+  },
+  async getPapers() {
+    const {data,error} = await supabase.from("papers").select("*").order("created_at",{ascending:false});
+    if(error) throw error;
+    return (data||[]).map(p=>({...p,assignedTo:p.assigned_to,quizType:p.quiz_type,weekId:p.week_id,createdAt:new Date(p.created_at).getTime()}));
+  },
+  async savePaper(p) {
+    const {error} = await supabase.from("papers").upsert({id:p.id,title:p.title,questions:p.questions,quiz_type:p.quizType||"mix",assigned_to:p.assignedTo||[],week_id:p.weekId||null});
+    if(error) throw error;
+  },
+  async deletePaper(id) {
+    const {error} = await supabase.from("papers").delete().eq("id",id);
+    if(error) throw error;
+  },
+  async getAttempts() {
+    const {data,error} = await supabase.from("attempts").select("*").order("submitted_at",{ascending:false});
+    if(error) throw error;
+    return (data||[]).map(a=>({...a,studentId:a.student_id,paperId:a.paper_id,submittedAt:new Date(a.submitted_at).getTime()}));
+  },
+  async saveAttempt(a) {
+    const {error} = await supabase.from("attempts").upsert({id:a.id,student_id:a.studentId,paper_id:a.paperId,answers:a.answers,score:a.score,total:a.total,submitted:a.submitted});
+    if(error) throw error;
+  },
+  async getWeeks() {
+    const {data,error} = await supabase.from("weeks").select("*").order("week_num");
+    if(error) throw error;
+    return (data||[]).map(w=>({...w,weekNum:w.week_num,publishDate:w.publish_date,paperId:w.paper_id,createdAt:new Date(w.created_at).getTime()}));
+  },
+  async saveWeek(w) {
+    const {error} = await supabase.from("weeks").upsert({id:w.id,week_num:w.weekNum,title:w.title,passage:w.passage||"",keywords:w.keywords||[],status:w.status,publish_date:w.publishDate||null,paper_id:w.paperId||null});
+    if(error) throw error;
+  },
+  async deleteWeek(id) {
+    const {error} = await supabase.from("weeks").delete().eq("id",id);
+    if(error) throw error;
+  },
+  // ─── File Storage ───────────────────────────────────────────────────────────
+  async uploadFile(file, path, onProgress) {
+    // Upload with progress tracking
+    return new Promise(async (resolve, reject) => {
+      try {
+        const {data, error} = await supabase.storage.from("quiz-files").upload(path, file, {
+          cacheControl:"3600", upsert:true,
+          onUploadProgress: p => onProgress && onProgress(Math.round(p.loaded/p.total*100))
+        });
+        if(error) reject(error);
+        else {
+          const {data:{publicUrl}} = supabase.storage.from("quiz-files").getPublicUrl(path);
+          resolve(publicUrl);
+        }
+      } catch(e){reject(e);}
+    });
+  },
+  async deleteFile(path) {
+    await supabase.storage.from("quiz-files").remove([path]);
+  }
+};
+
+// ─── AI Helpers ───────────────────────────────────────────────────────────────
+async function callClaude(messages, maxTokens=3000) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+    body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:maxTokens,messages})
+  });
+  const data = await res.json();
+  if(data.error) throw new Error(data.error.message);
+  return data.content.map(i=>i.text||"").join("");
+}
+
+async function fileToBase64(file) {
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=()=>res(r.result.split(",")[1]);
+    r.onerror=rej;
+    r.readAsDataURL(file);
+  });
+}
+
+async function extractPDFPages(file, pageSpec) {
+  const base64=await fileToBase64(file);
+  const prompt=pageSpec
+    ?`Extract text ONLY from pages ${pageSpec} of this PDF. Return plain text only.`
+    :`Extract ALL readable text. Return plain text only.`;
+  return callClaude([{role:"user",content:[
+    {type:"document",source:{type:"base64",media_type:"application/pdf",data:base64}},
+    {type:"text",text:prompt}
+  ]}],4000);
+}
+
+async function extractImageText(file) {
+  const base64=await fileToBase64(file);
+  const mt=file.type||"image/jpeg";
+  return callClaude([{role:"user",content:[
+    {type:"image",source:{type:"base64",media_type:mt,data:base64}},
+    {type:"text",text:"Extract ALL readable text from this image. Return plain text only."}
+  ]}],3000);
+}
+
+async function extractKeywords(text,count=15) {
+  const raw=await callClaude([{role:"user",content:`From this English text, extract the ${count} most important vocabulary words for an English learner.
+Text: ${text}
+Respond ONLY with a JSON array: [{"word":"...","definition":"...","partOfSpeech":"..."}]
+No markdown, no explanation.`}]);
+  const m=raw.match(/\[[\s\S]*\]/);if(!m)throw new Error("No JSON");
+  return JSON.parse(m[0]);
+}
+
+async function generateQuizFromText(text,quizType,count) {
+  const typeMap={
+    vocabulary:"Generate ONLY vocabulary MCQs testing word meaning or definition.",
+    prepositions:"Generate ONLY preposition MCQs — sentences with a blank for a preposition.",
+    fill_blank:"Generate ONLY fill-in-the-blank MCQs — sentences with one word missing.",
+    mix:"Generate a balanced mix of vocabulary, preposition, and fill-in-the-blank questions."
+  };
+  const raw=await callClaude([{role:"user",content:`You are an English teacher. Generate exactly ${count} MCQs.
+Type: ${typeMap[quizType]||typeMap.mix}
+Text: ${text.slice(0,6000)}
+Respond ONLY with a valid JSON array, no markdown:
+[{"question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"answer":"A","type":"vocabulary"}]`}],4000);
+  const m=raw.match(/\[[\s\S]*\]/);if(!m)throw new Error("No JSON");
+  return JSON.parse(m[0]);
+}
+
+// ─── PDF Download ─────────────────────────────────────────────────────────────
+function downloadPDF(paper,studentName=null,attempt=null) {
+  const css=`*{margin:0;padding:0;box-sizing:border-box}body{font-family:Arial,sans-serif;padding:40px;color:#1a1a1a;font-size:14px}.hdr{border-bottom:3px solid #2563eb;padding-bottom:16px;margin-bottom:24px}h1{font-size:22px;font-weight:700;color:#1e3a8a}.meta{font-size:12px;color:#6b7280;margin-top:6px}.sb{background:#1e3a8a;color:#fff;padding:12px 20px;border-radius:10px;display:inline-block;margin-bottom:24px}.sb .p{font-size:28px;font-weight:700}.sb .l{font-size:12px;opacity:.8}.q{margin:18px 0;padding:16px;border:1px solid #e5e7eb;border-radius:10px;page-break-inside:avoid}.qn{font-size:11px;color:#6b7280;font-weight:600;margin-bottom:6px;text-transform:uppercase}.qt{font-weight:600;margin-bottom:12px;line-height:1.5}.o{padding:8px 14px;border-radius:6px;margin:4px 0;font-size:13px;display:flex;justify-content:space-between;border:1px solid #e5e7eb}.c{background:#d1fae5;border-color:#6ee7b7;color:#065f46;font-weight:600}.w{background:#fee2e2;border-color:#fca5a5;color:#991b1b;font-weight:600}.n{background:#f9fafb}`;
+  const meta=[`Questions: ${paper.questions.length}`,`Date: ${new Date().toLocaleDateString()}`,studentName?`Student: ${studentName}`:null].filter(Boolean).join(" &nbsp;|&nbsp; ");
+  const score=attempt?`<div class="sb"><div class="p">${attempt.score}/${attempt.total} &nbsp; ${Math.round(attempt.score/attempt.total*100)}%</div><div class="l">Final Score</div></div>`:"";
+  const qs=paper.questions.map((q,i)=>{
+    const ch=attempt?.answers?.[i],co=q.answer;
+    return `<div class="q"><div class="qn">Q${i+1}</div><div class="qt">${q.question}</div>${q.options.map(o=>{
+      const l=o[0];let cl="o n";
+      if(attempt){if(l===co)cl="o c";else if(l===ch&&ch!==co)cl="o w";}
+      const t=attempt?(l===ch&&l===co?"✓ Your answer":l===ch?"✗ Your answer":l===co?"← Correct":""):(l===co?"✓":"");
+      return `<div class="${cl}">${o}<span style="font-size:11px;opacity:.8">${t}</span></div>`;
+    }).join("")}</div>`;
+  }).join("");
+  const html=`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${paper.title}</title><style>${css}</style></head><body><div class="hdr"><h1>${paper.title}</h1><div class="meta">${meta}</div></div>${score}${qs}<script>window.onload=()=>window.print()<\/script></body></html>`;
+  const blob=new Blob([html],{type:"text/html"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.target="_blank";a.download=`${paper.title.replace(/\s+/g,"_")}.html`;a.click();
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+const S={
+  input:{width:"100%",border:"1px solid #e5e7eb",borderRadius:8,padding:"10px 12px",fontSize:13,outline:"none",boxSizing:"border-box",fontFamily:"inherit",background:"#fff"},
+  label:{display:"block",fontSize:12,fontWeight:600,color:"#374151",marginBottom:5,textTransform:"uppercase",letterSpacing:".4px"},
+  btn:(c="gray",ex={})=>({border:"none",borderRadius:8,padding:"9px 16px",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+    background:c==="blue"?"#2563eb":c==="green"?"#059669":c==="red"?"#dc2626":c==="purple"?"#7c3aed":c==="orange"?"#d97706":"#f3f4f6",
+    color:["blue","green","red","purple","orange"].includes(c)?"#fff":"#374151",...ex})
+};
+const {useState,useEffect,useRef,useCallback}=React;
+function Card({children,style={}}){return <div style={{background:"#fff",borderRadius:12,border:"1px solid #e5e7eb",padding:24,...style}}>{children}</div>;}
+function Pct({val}){return <span style={{background:val>=70?"#d1fae5":val>=50?"#fef3c7":"#fee2e2",color:val>=70?"#065f46":val>=50?"#92400e":"#991b1b",padding:"2px 9px",borderRadius:12,fontSize:11,fontWeight:700}}>{val}%</span>;}
+function Modal({children,onClose,wide=false}){
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:50,padding:16}}>
+    <div style={{background:"#fff",borderRadius:16,width:"100%",maxWidth:wide?860:660,maxHeight:"92vh",overflow:"auto",padding:28,boxShadow:"0 25px 50px rgba(0,0,0,0.2)"}}>{children}</div>
+  </div>;
+}
+function Spinner(){return <div style={{display:"inline-block",width:16,height:16,border:"2px solid #e5e7eb",borderTopColor:"#2563eb",borderRadius:"50%",animation:"spin 0.8s linear infinite",verticalAlign:"middle",marginRight:6}}/>;}
+function ProgressBar({pct,label}){
+  return <div style={{marginBottom:12}}>
+    {label&&<div style={{fontSize:12,color:"#6b7280",marginBottom:4}}>{label} {pct}%</div>}
+    <div style={{background:"#e5e7eb",borderRadius:6,height:8}}>
+      <div style={{background:"#2563eb",borderRadius:6,height:8,width:`${pct}%`,transition:"width .3s"}}/>
+    </div>
+  </div>;
+}
+function Alert({msg,type="error"}){
+  const bg=type==="error"?"#fef2f2":type==="success"?"#ecfdf5":"#eff6ff";
+  const col=type==="error"?"#dc2626":type==="success"?"#059669":"#2563eb";
+  const border=type==="error"?"#fecaca":type==="success"?"#6ee7b7":"#bfdbfe";
+  return <div style={{background:bg,border:`1px solid ${border}`,borderRadius:8,padding:"10px 14px",color:col,fontSize:13,marginBottom:14}}>{msg}</div>;
+}
+
+// ─── App Root ─────────────────────────────────────────────────────────────────
+function App(){
+  const [screen,setScreen]=useState("login");
+  const [user,setUser]=useState(null);
+  const [students,setStudents]=useState([]);
+  const [papers,setPapers]=useState([]);
+  const [attempts,setAttempts]=useState([]);
+  const [weeks,setWeeks]=useState([]);
+  const [ready,setReady]=useState(false);
+  const [dbError,setDbError]=useState("");
+
+  useEffect(()=>{loadAll();},[]);
+
+  async function loadAll(){
+    try {
+      const [sts,ps,at,wk]=await Promise.all([db.getStudents(),db.getPapers(),db.getAttempts(),db.getWeeks()]);
+      setStudents(sts);setPapers(ps);setAttempts(at);setWeeks(wk);
+    } catch(e){setDbError("Database connection failed: "+e.message);}
+    setReady(true);
+  }
+
+  async function refresh(){
+    try {
+      const [sts,ps,at,wk]=await Promise.all([db.getStudents(),db.getPapers(),db.getAttempts(),db.getWeeks()]);
+      setStudents(sts);setPapers(ps);setAttempts(at);setWeeks(wk);
+    } catch(e){console.error(e);}
+  }
+
+  // Real-time subscriptions — updates all clients instantly when data changes
+  useEffect(()=>{
+    const ch=supabase.channel("app-changes")
+      .on("postgres_changes",{event:"*",schema:"public",table:"students"},()=>db.getStudents().then(setStudents))
+      .on("postgres_changes",{event:"*",schema:"public",table:"papers"},()=>db.getPapers().then(setPapers))
+      .on("postgres_changes",{event:"*",schema:"public",table:"attempts"},()=>db.getAttempts().then(setAttempts))
+      .on("postgres_changes",{event:"*",schema:"public",table:"weeks"},()=>db.getWeeks().then(setWeeks))
+      .subscribe();
+    return ()=>supabase.removeChannel(ch);
+  },[]);
+
+  function login(u,p){
+    if(u==="teacher"&&p==="teacher123"){setUser({role:"teacher",name:"Teacher"});setScreen("teacher");return true;}
+    const st=students.find(s=>s.username===u&&s.password===p);
+    if(st){setUser({...st,role:"student"});setScreen("student");return true;}
+    return false;
+  }
+  const logout=()=>{setUser(null);setScreen("login");};
+
+  if(!ready) return (
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",gap:16}}>
+      <div style={{fontSize:40}}>📚</div>
+      <div style={{fontWeight:600,color:"#374151",fontSize:16}}>Connecting to database…</div>
+      {dbError&&<Alert msg={dbError}/>}
+    </div>
+  );
+
+  const props={user,students,papers,attempts,weeks,onLogout:logout,refresh,
+    reloadStudents:()=>db.getStudents().then(setStudents),
+    reloadPapers:()=>db.getPapers().then(setPapers),
+    reloadAttempts:()=>db.getAttempts().then(setAttempts),
+    reloadWeeks:()=>db.getWeeks().then(setWeeks)};
+
+  return <>
+    {dbError&&<div style={{background:"#fef2f2",borderBottom:"1px solid #fecaca",padding:"8px 20px",fontSize:13,color:"#dc2626",textAlign:"center"}}>⚠️ {dbError}</div>}
+    {screen==="login"  &&<LoginScreen onLogin={login} students={students}/>}
+    {screen==="teacher"&&<TeacherApp {...props}/>}
+    {screen==="student"&&<StudentApp {...props}/>}
+  </>;
+}
+
+// ─── Login ────────────────────────────────────────────────────────────────────
+function LoginScreen({onLogin,students}){
+  const [u,setU]=useState("");const [p,setP]=useState("");const [err,setErr]=useState("");
+  const go=()=>{if(!onLogin(u,p))setErr("Invalid credentials.");};
+  return (
+    <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#1e3a8a,#3b82f6)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{background:"#fff",borderRadius:20,padding:44,width:380,boxShadow:"0 25px 50px rgba(0,0,0,0.2)"}}>
+        <div style={{textAlign:"center",marginBottom:32}}>
+          <div style={{fontSize:44,marginBottom:10}}>📚</div>
+          <h1 style={{fontSize:24,fontWeight:700,color:"#111827",margin:0}}>English Quiz App</h1>
+          <p style={{color:"#9ca3af",fontSize:13,marginTop:6}}>Sign in to continue</p>
+        </div>
+        <label style={S.label}>Username</label>
+        <input style={{...S.input,marginBottom:12}} placeholder="Enter username" value={u} onChange={e=>setU(e.target.value)}/>
+        <label style={S.label}>Password</label>
+        <input style={{...S.input,marginBottom:16}} type="password" placeholder="Enter password" value={p} onChange={e=>setP(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()}/>
+        {err&&<Alert msg={err}/>}
+        <button onClick={go} style={{...S.btn("blue"),width:"100%",padding:"13px 0",fontSize:15}}>Sign In</button>
+        <div style={{marginTop:20,background:"#f9fafb",borderRadius:10,padding:14,fontSize:12,color:"#6b7280",lineHeight:2.2}}>
+          <div><b>Teacher:</b> teacher / teacher123</div>
+          <div><b>Students:</b> {students.map(s=>`${s.username}/${s.password}`).join(" · ")||"ali/ali123 · sara/sara123"}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Sidebar ──────────────────────────────────────────────────────────────────
+function Sidebar({tabs,active,onSelect,role,onLogout,onRefresh}){
+  return (
+    <div style={{width:215,background:"#1e3a8a",display:"flex",flexDirection:"column",flexShrink:0,minHeight:"100vh"}}>
+      <div style={{padding:"22px 18px 14px",borderBottom:"1px solid rgba(255,255,255,0.1)"}}>
+        <div style={{fontSize:17,fontWeight:700,color:"#fff"}}>📚 QuizApp</div>
+        <div style={{fontSize:11,color:"rgba(255,255,255,0.5)",marginTop:2}}>{role==="teacher"?"Teacher Panel":"Student Panel"}</div>
+        <div style={{marginTop:8,fontSize:10,color:"rgba(255,255,255,0.35)",display:"flex",alignItems:"center",gap:5}}>
+          <span style={{width:5,height:5,borderRadius:"50%",background:"#34d399",display:"inline-block"}}></span>Live database
+        </div>
+      </div>
+      <nav style={{flex:1,padding:"10px 8px"}}>
+        {tabs.map(t=>(
+          <button key={t.id} onClick={()=>onSelect(t.id)} style={{width:"100%",textAlign:"left",padding:"10px 14px",borderRadius:8,border:"none",cursor:"pointer",fontSize:13,fontWeight:active===t.id?600:400,background:active===t.id?"rgba(255,255,255,0.15)":"transparent",color:active===t.id?"#fff":"rgba(255,255,255,0.6)",display:"flex",alignItems:"center",gap:10,marginBottom:2,fontFamily:"inherit"}}>
+            {t.icon} {t.label}
+          </button>
+        ))}
+      </nav>
+      <div style={{padding:"10px 8px",borderTop:"1px solid rgba(255,255,255,0.1)"}}>
+        <button onClick={onRefresh} style={{width:"100%",textAlign:"left",padding:"9px 14px",border:"none",background:"transparent",cursor:"pointer",fontSize:12,color:"rgba(255,255,255,0.4)",fontFamily:"inherit"}}>🔄 Refresh</button>
+        <button onClick={onLogout} style={{width:"100%",textAlign:"left",padding:"9px 14px",border:"none",background:"transparent",cursor:"pointer",fontSize:13,color:"rgba(255,255,255,0.45)",fontFamily:"inherit"}}>← Logout</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Teacher App ──────────────────────────────────────────────────────────────
+function TeacherApp(props){
+  const [tab,setTab]=useState("dashboard");
+  const tabs=[
+    {id:"dashboard",label:"Dashboard",   icon:"📊"},
+    {id:"course",   label:"Course Weeks",icon:"📅"},
+    {id:"generate", label:"Generate Quiz",icon:"✨"},
+    {id:"papers",   label:"All Papers",  icon:"📄"},
+    {id:"students", label:"Students",    icon:"👨‍🎓"},
+    {id:"results",  label:"Results",     icon:"📈"},
+  ];
+  return (
+    <div style={{display:"flex",minHeight:"100vh",background:"#f8fafc"}}>
+      <Sidebar tabs={tabs} active={tab} onSelect={setTab} role="teacher" onLogout={props.onLogout} onRefresh={props.refresh}/>
+      <div style={{flex:1,overflow:"auto"}}>
+        {tab==="dashboard"&&<Dashboard {...props}/>}
+        {tab==="course"   &&<CourseManager {...props}/>}
+        {tab==="generate" &&<GenerateQuiz {...props}/>}
+        {tab==="papers"   &&<PapersTab {...props}/>}
+        {tab==="students" &&<StudentsTab {...props}/>}
+        {tab==="results"  &&<ResultsTab {...props}/>}
+      </div>
+    </div>
+  );
+}
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+function Dashboard({students,papers,attempts,weeks}){
+  const done=attempts.filter(a=>a.submitted);
+  const avg=done.length?Math.round(done.reduce((s,a)=>s+a.score/a.total*100,0)/done.length):0;
+  const published=weeks.filter(w=>w.status==="published"||(w.status==="scheduled"&&new Date(w.publishDate)<=new Date()));
+  const stats=[
+    {label:"Students",  value:students.length,icon:"👨‍🎓",bg:"#eff6ff",col:"#2563eb"},
+    {label:"Papers",    value:papers.length,  icon:"📄",  bg:"#f5f3ff",col:"#7c3aed"},
+    {label:"Attempts",  value:done.length,    icon:"✅",  bg:"#ecfdf5",col:"#059669"},
+    {label:"Avg Score", value:`${avg}%`,      icon:"📈",  bg:"#fff7ed",col:"#d97706"},
+    {label:"Weeks Live",value:published.length,icon:"📅", bg:"#fdf4ff",col:"#a21caf"},
+  ];
+  const recent=[...done].sort((a,b)=>b.submittedAt-a.submittedAt).slice(0,5);
+  return (
+    <div style={{padding:32}}>
+      <h2 style={{fontSize:20,fontWeight:700,color:"#111827",marginBottom:24,marginTop:0}}>Dashboard</h2>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:14,marginBottom:28}}>
+        {stats.map(s=>(
+          <Card key={s.label} style={{padding:18}}>
+            <div style={{width:38,height:38,borderRadius:10,background:s.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,marginBottom:10}}>{s.icon}</div>
+            <div style={{fontSize:26,fontWeight:700,color:"#111827"}}>{s.value}</div>
+            <div style={{fontSize:11,color:"#9ca3af",marginTop:2}}>{s.label}</div>
+          </Card>
+        ))}
+      </div>
+      <Card>
+        <h3 style={{margin:"0 0 16px",fontSize:14,fontWeight:600}}>Recent Attempts</h3>
+        {recent.length===0?<p style={{color:"#9ca3af",fontSize:13}}>No attempts yet.</p>:(
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+            <thead><tr style={{color:"#9ca3af",fontSize:12,borderBottom:"2px solid #f3f4f6"}}>
+              {["Student","Paper","Score","%","Date"].map(h=><th key={h} style={{textAlign:"left",paddingBottom:10,fontWeight:500}}>{h}</th>)}
+            </tr></thead>
+            <tbody>{recent.map(a=>{
+              const st=students.find(s=>s.id===a.studentId),p=papers.find(p=>p.id===a.paperId),pct=Math.round(a.score/a.total*100);
+              return <tr key={a.id} style={{borderTop:"1px solid #f3f4f6"}}>
+                <td style={{padding:"11px 0",fontWeight:600}}>{st?.name||"?"}</td>
+                <td style={{color:"#6b7280"}}>{p?.title||"?"}</td>
+                <td>{a.score}/{a.total}</td><td><Pct val={pct}/></td>
+                <td style={{color:"#9ca3af"}}>{new Date(a.submittedAt).toLocaleDateString()}</td>
+              </tr>;
+            })}</tbody>
+          </table>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+// ─── Course Manager ───────────────────────────────────────────────────────────
+function CourseManager({weeks,reloadWeeks,papers,reloadPapers,students}){
+  const [showForm,setShowForm]=useState(false);
+  const [editWeek,setEditWeek]=useState(null);
+  const now=new Date();
+
+  async function deleteWeek(id){
+    if(!confirm("Delete this week?"))return;
+    await db.deleteWeek(id);await reloadWeeks();
+  }
+  async function publishNow(w){
+    await db.saveWeek({...w,status:"published"});await reloadWeeks();
+  }
+
+  const sorted=[...weeks].sort((a,b)=>a.weekNum-b.weekNum).map(w=>{
+    if(w.status==="scheduled"&&new Date(w.publishDate)<=now)return{...w,status:"published"};
+    return w;
+  });
+
+  const ss={published:{bg:"#ecfdf5",col:"#065f46"},scheduled:{bg:"#eff6ff",col:"#1e40af"},draft:{bg:"#f3f4f6",col:"#6b7280"}};
+
+  return (
+    <div style={{padding:32}}>
+      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:24}}>
+        <div>
+          <h2 style={{fontSize:20,fontWeight:700,color:"#111827",margin:0}}>Course Weeks</h2>
+          <p style={{fontSize:13,color:"#9ca3af",marginTop:4}}>Schedule weekly reading material and vocabulary quizzes</p>
+        </div>
+        <button onClick={()=>{setEditWeek(null);setShowForm(true);}} style={{...S.btn("blue"),padding:"10px 20px"}}>+ Add Week</button>
+      </div>
+      {sorted.length===0?(
+        <Card style={{textAlign:"center",padding:56}}><div style={{fontSize:40,marginBottom:12}}>📅</div><p style={{color:"#9ca3af"}}>No weeks yet. Click <b>Add Week</b> to start.</p></Card>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          {sorted.map(week=>{
+            const st=ss[week.status]||ss.draft;
+            const lp=papers.find(p=>p.id===week.paperId);
+            const asg=lp?(lp.assignedTo==="all"?students:students.filter(s=>(lp.assignedTo||[]).includes(s.id))):[];
+            return (
+              <Card key={week.id}>
+                <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:14}}>
+                  <div style={{flex:1}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:4}}>
+                      <span style={{fontSize:12,fontWeight:700,color:"#9ca3af"}}>WEEK {week.weekNum}</span>
+                      <h3 style={{margin:0,fontSize:15,fontWeight:700,color:"#111827"}}>{week.title}</h3>
+                      <span style={{fontSize:11,background:st.bg,color:st.col,padding:"2px 10px",borderRadius:12,fontWeight:600,textTransform:"capitalize"}}>{week.status}</span>
+                      {week.status==="scheduled"&&<span style={{fontSize:11,color:"#6b7280"}}>→ {new Date(week.publishDate).toLocaleDateString()}</span>}
+                    </div>
+                    {week.passage&&<p style={{fontSize:12,color:"#6b7280",margin:0}}>{week.passage.slice(0,100)}…</p>}
+                  </div>
+                  <div style={{display:"flex",gap:8,flexShrink:0,marginLeft:12}}>
+                    {week.status==="draft"&&<button onClick={()=>publishNow(week)} style={S.btn("green")}>Publish</button>}
+                    <button onClick={()=>{setEditWeek(week);setShowForm(true);}} style={S.btn("gray")}>Edit</button>
+                    <button onClick={()=>deleteWeek(week.id)} style={{...S.btn("gray"),color:"#dc2626"}}>Delete</button>
+                  </div>
+                </div>
+                {week.keywords?.length>0&&(
+                  <div style={{marginBottom:12}}>
+                    <div style={{fontSize:11,fontWeight:700,color:"#374151",marginBottom:6,textTransform:"uppercase",letterSpacing:".4px"}}>Keywords ({week.keywords.length})</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                      {week.keywords.slice(0,10).map((kw,i)=>(
+                        <span key={i} style={{fontSize:12,background:"#eff6ff",color:"#2563eb",padding:"3px 10px",borderRadius:20}}>{kw.word}</span>
+                      ))}
+                      {week.keywords.length>10&&<span style={{fontSize:12,color:"#9ca3af",padding:"3px 6px"}}>+{week.keywords.length-10} more</span>}
+                    </div>
+                  </div>
+                )}
+                <div style={{background:"#f9fafb",borderRadius:10,padding:12,display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+                  <span style={{fontSize:12,color:"#374151"}}>
+                    <b>Quiz:</b> {lp?<span style={{color:"#059669"}}>✓ {lp.title} · {lp.assignedTo==="all"?"All":asg.map(s=>s.name).join(", ")||"None"}</span>:<span style={{color:"#9ca3af"}}>Not generated</span>}
+                  </span>
+                  {week.passage&&<WeekQuizControls week={week} weeks={weeks} reloadWeeks={reloadWeeks} papers={papers} reloadPapers={reloadPapers} students={students}/>}
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+      {showForm&&<WeekFormModal week={editWeek} weeks={weeks} reloadWeeks={reloadWeeks} onClose={()=>setShowForm(false)}/>}
+    </div>
+  );
+}
+
+function WeekQuizControls({week,weeks,reloadWeeks,papers,reloadPapers,students}){
+  const [loading,setLoading]=useState(false);
+  const [showAssign,setShowAssign]=useState(false);
+  const lp=papers.find(p=>p.id===week.paperId);
+
+  async function generate(){
+    setLoading(true);
+    try {
+      const qs=await generateQuizFromText(week.passage,"vocabulary",10);
+      const paper={id:"p"+Date.now(),title:`Week ${week.weekNum} — ${week.title}`,questions:qs,quizType:"vocabulary",assignedTo:[],weekId:week.id,createdAt:Date.now()};
+      await db.savePaper(paper);
+      const updatedWeek={...week,paperId:paper.id};
+      await db.saveWeek(updatedWeek);
+      await Promise.all([reloadPapers(),reloadWeeks()]);
+    } catch(e){alert("Failed: "+e.message);}
+    setLoading(false);
+  }
+
+  async function toggleAll(){
+    if(!lp)return;
+    const isAll=lp.assignedTo==="all"||(Array.isArray(lp.assignedTo)&&lp.assignedTo.includes("all"));
+    await db.savePaper({...lp,assignedTo:isAll?[]:["all"]});await reloadPapers();
+  }
+  async function toggleStudent(sid){
+    if(!lp||isAllAssigned())return;
+    const cur=Array.isArray(lp.assignedTo)?lp.assignedTo.filter(x=>x!=="all"):[];
+    await db.savePaper({...lp,assignedTo:cur.includes(sid)?cur.filter(x=>x!==sid):[...cur,sid]});await reloadPapers();
+  }
+  function isAllAssigned(){return lp&&(lp.assignedTo==="all"||(Array.isArray(lp.assignedTo)&&lp.assignedTo.includes("all")));}
+  function isAssigned(sid){return isAllAssigned()||(Array.isArray(lp?.assignedTo)&&lp.assignedTo.includes(sid));}
+
+  if(!lp) return <button onClick={generate} disabled={loading} style={{...S.btn("purple"),fontSize:12,padding:"6px 14px",opacity:loading?.6:1}}>{loading?<><Spinner/>Generating…</>:"✨ Generate Quiz"}</button>;
+  return (
+    <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+      <button onClick={()=>setShowAssign(v=>!v)} style={{...S.btn("blue"),fontSize:12,padding:"6px 14px"}}>👥 Assign</button>
+      <button onClick={()=>downloadPDF(lp)} style={{...S.btn("gray"),fontSize:12,padding:"6px 14px"}}>⬇ PDF</button>
+      {showAssign&&<div style={{width:"100%",marginTop:8,display:"flex",gap:6,flexWrap:"wrap"}}>
+        <button onClick={toggleAll} style={{padding:"5px 12px",borderRadius:20,border:`2px solid ${isAllAssigned()?"#2563eb":"#e5e7eb"}`,background:isAllAssigned()?"#2563eb":"#fff",color:isAllAssigned()?"#fff":"#374151",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{isAllAssigned()?"✓ ":""}All</button>
+        {students.map(s=><button key={s.id} onClick={()=>toggleStudent(s.id)} style={{padding:"5px 12px",borderRadius:20,border:`2px solid ${isAssigned(s.id)?"#2563eb":"#e5e7eb"}`,background:isAssigned(s.id)?"#eff6ff":"#fff",color:isAssigned(s.id)?"#2563eb":"#374151",fontSize:12,fontWeight:isAssigned(s.id)?700:400,cursor:"pointer",fontFamily:"inherit"}}>{isAssigned(s.id)?"✓ ":""}{s.name}</button>)}
+      </div>}
+    </div>
+  );
+}
+
+function WeekFormModal({week,weeks,reloadWeeks,onClose}){
+  const isEdit=!!week;
+  const nextNum=weeks.length?Math.max(...weeks.map(w=>w.weekNum))+1:1;
+  const [weekNum,setWeekNum]=useState(week?.weekNum||nextNum);
+  const [title,setTitle]=useState(week?.title||"");
+  const [passage,setPassage]=useState(week?.passage||"");
+  const [status,setStatus]=useState(week?.status||"draft");
+  const [publishDate,setPubDate]=useState(week?.publishDate||"");
+  const [keywords,setKeywords]=useState(week?.keywords||[]);
+  const [pdfFile,setPdfFile]=useState(null);
+  const [pageSpec,setPageSpec]=useState("");
+  const [kwCount,setKwCount]=useState(15);
+  const [loadingPDF,setLoadPDF]=useState(false);
+  const [loadingKW,setLoadKW]=useState(false);
+  const [uploadPct,setUploadPct]=useState(0);
+  const [uploading,setUploading]=useState(false);
+  const [error,setError]=useState("");
+  const fileRef=useRef();
+
+  async function extractPDF(){
+    if(!pdfFile)return;
+    setLoadPDF(true);setError("");
+    try{const t=await extractPDFPages(pdfFile,pageSpec);setPassage(t);}
+    catch(e){setError("PDF failed: "+e.message);}
+    setLoadPDF(false);
+  }
+  async function extractKW(){
+    if(!passage.trim())return setError("Paste or extract passage first.");
+    setLoadKW(true);setError("");
+    try{const kw=await extractKeywords(passage,kwCount);setKeywords(kw);}
+    catch(e){setError("Keyword extraction failed: "+e.message);}
+    setLoadKW(false);
+  }
+  async function uploadPDFToStorage(){
+    if(!pdfFile)return;
+    setUploading(true);setError("");
+    try{
+      const path=`weeks/week${weekNum}_${Date.now()}.pdf`;
+      await db.uploadFile(pdfFile,path,p=>setUploadPct(p));
+      alert("✅ PDF uploaded to cloud storage!");
+    }catch(e){setError("Upload failed: "+e.message);}
+    setUploading(false);setUploadPct(0);
+  }
+  async function save(){
+    if(!title.trim())return setError("Title required.");
+    if(status==="scheduled"&&!publishDate)return setError("Set a publish date.");
+    const w={id:week?.id||"w"+Date.now(),weekNum:+weekNum,title:title.trim(),passage,keywords,status,publishDate:publishDate||null,paperId:week?.paperId||null};
+    await db.saveWeek(w);await reloadWeeks();onClose();
+  }
+
+  return (
+    <Modal onClose={onClose} wide>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:22}}>
+        <h3 style={{margin:0,fontSize:17,fontWeight:700}}>{isEdit?"Edit":"Add"} Week</h3>
+        <button onClick={onClose} style={S.btn("gray")}>✕ Close</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+        <div><label style={S.label}>Week #</label><input style={S.input} type="number" min="1" value={weekNum} onChange={e=>setWeekNum(e.target.value)}/></div>
+        <div><label style={S.label}>Title</label><input style={S.input} placeholder="e.g. Animals & Nature" value={title} onChange={e=>setTitle(e.target.value)}/></div>
+      </div>
+      <div style={{marginBottom:14}}>
+        <label style={S.label}>Status</label>
+        <div style={{display:"flex",gap:8}}>
+          {["draft","published","scheduled"].map(s=><button key={s} onClick={()=>setStatus(s)} style={{padding:"7px 16px",borderRadius:8,border:`2px solid ${status===s?"#2563eb":"#e5e7eb"}`,background:status===s?"#eff6ff":"#fff",color:status===s?"#2563eb":"#374151",fontWeight:status===s?700:400,fontSize:13,cursor:"pointer",fontFamily:"inherit",textTransform:"capitalize"}}>{s}</button>)}
+        </div>
+        {status==="scheduled"&&<div style={{marginTop:10}}><label style={S.label}>Publish Date</label><input style={{...S.input,width:"auto"}} type="date" value={publishDate} onChange={e=>setPubDate(e.target.value)}/></div>}
+      </div>
+      {/* PDF Upload */}
+      <div style={{marginBottom:14}}>
+        <label style={S.label}>PDF File</label>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+          <input ref={fileRef} type="file" accept=".pdf" style={{display:"none"}} onChange={e=>setPdfFile(e.target.files[0]||null)}/>
+          <button onClick={()=>fileRef.current.click()} style={S.btn("gray")}>{pdfFile?`📄 ${pdfFile.name}`:"📎 Choose PDF"}</button>
+          <input style={{...S.input,width:170}} placeholder="Pages e.g. 1-3, 5" value={pageSpec} onChange={e=>setPageSpec(e.target.value)}/>
+          <button onClick={extractPDF} disabled={!pdfFile||loadingPDF} style={{...S.btn("purple"),opacity:!pdfFile||loadingPDF?.6:1}}>{loadingPDF?<><Spinner/>Extracting…</>:"Extract Text"}</button>
+          <button onClick={uploadPDFToStorage} disabled={!pdfFile||uploading} style={{...S.btn("orange"),opacity:!pdfFile||uploading?.6:1}}>{uploading?<><Spinner/>Uploading…</>:"☁ Upload to Cloud"}</button>
+        </div>
+        {uploading&&<ProgressBar pct={uploadPct} label="Uploading PDF"/>}
+        <p style={{fontSize:11,color:"#9ca3af",marginTop:4}}>Extract Text = reads text for quiz. Upload to Cloud = stores the full PDF file.</p>
+      </div>
+      <div style={{marginBottom:14}}>
+        <label style={S.label}>Reading Passage</label>
+        <textarea style={{...S.input,height:150,resize:"vertical"}} placeholder="Paste or extract from PDF…" value={passage} onChange={e=>setPassage(e.target.value)}/>
+        {passage&&<p style={{fontSize:11,color:"#059669",marginTop:4}}>✓ {passage.length} characters</p>}
+      </div>
+      <div style={{marginBottom:18}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+          <label style={S.label}>Key Vocabulary</label>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <select style={{...S.input,width:"auto",fontSize:12,padding:"5px 10px"}} value={kwCount} onChange={e=>setKwCount(+e.target.value)}>
+              {[10,15,20,25].map(n=><option key={n} value={n}>{n} words</option>)}
+            </select>
+            <button onClick={extractKW} disabled={!passage||loadingKW} style={{...S.btn("orange"),fontSize:12,padding:"7px 14px",opacity:!passage||loadingKW?.6:1}}>{loadingKW?<><Spinner/>Extracting…</>:"🔍 Extract Keywords"}</button>
+          </div>
+        </div>
+        {keywords.length>0?(
+          <div style={{border:"1px solid #e5e7eb",borderRadius:10,overflow:"hidden",maxHeight:220,overflow:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+              <thead><tr style={{background:"#f9fafb",position:"sticky",top:0}}>
+                {["Word","Part of Speech","Definition"].map(h=><th key={h} style={{textAlign:"left",padding:"8px 12px",fontWeight:600,fontSize:11,color:"#6b7280",textTransform:"uppercase"}}>{h}</th>)}
+              </tr></thead>
+              <tbody>{keywords.map((kw,i)=>(
+                <tr key={i} style={{borderTop:"1px solid #f3f4f6"}}>
+                  <td style={{padding:"8px 12px",fontWeight:700,color:"#2563eb"}}>{kw.word}</td>
+                  <td style={{padding:"8px 12px",color:"#9ca3af",fontSize:12}}>{kw.partOfSpeech}</td>
+                  <td style={{padding:"8px 12px",color:"#374151"}}>{kw.definition}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        ):<p style={{fontSize:12,color:"#9ca3af",margin:0}}>Click Extract Keywords after adding a passage.</p>}
+      </div>
+      {error&&<Alert msg={error}/>}
+      <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+        <button onClick={onClose} style={S.btn("gray")}>Cancel</button>
+        <button onClick={save} style={S.btn("blue")}>💾 Save Week</button>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── Generate Quiz ────────────────────────────────────────────────────────────
+function GenerateQuiz({papers,reloadPapers}){
+  const [text,setText]=useState("");const [qtype,setQtype]=useState("mix");const [count,setCount]=useState(5);
+  const [title,setTitle]=useState("");const [loading,setLoading]=useState(false);
+  const [fileLoading,setFLoad]=useState(false);const [error,setError]=useState("");
+  const [preview,setPreview]=useState(null);const [pdfFile,setPdfFile]=useState(null);
+  const [pageSpec,setPageSpec]=useState("");const [fileName,setFileName]=useState("");
+  const [uploadPct,setUploadPct]=useState(0);const [uploading,setUploading]=useState(false);
+  const fileRef=useRef();
+  const types=[{id:"vocabulary",label:"Vocabulary",icon:"📖"},{id:"prepositions",label:"Prepositions",icon:"🔗"},{id:"fill_blank",label:"Fill in Blank",icon:"✏️"},{id:"mix",label:"Mixed",icon:"🔀"}];
+
+  async function handleExtract(){
+    if(!pdfFile)return;setFLoad(true);setError("");
+    try{
+      const isPDF=pdfFile.type==="application/pdf"||pdfFile.name.toLowerCase().endsWith(".pdf");
+      const t=isPDF?await extractPDFPages(pdfFile,pageSpec):await extractImageText(pdfFile);
+      setText(t);setFileName(pdfFile.name+(pageSpec?` (pages: ${pageSpec})`:""));
+      if(!title)setTitle(pdfFile.name.replace(/\.[^.]+$/,""));
+    }catch(e){setError("Failed: "+e.message);}
+    setFLoad(false);
+  }
+
+  async function uploadFile(){
+    if(!pdfFile)return;setUploading(true);setError("");
+    try{
+      const path=`papers/${Date.now()}_${pdfFile.name}`;
+      await db.uploadFile(pdfFile,path,p=>setUploadPct(p));
+      alert("✅ File uploaded to cloud storage!");
+    }catch(e){setError("Upload failed: "+e.message);}
+    setUploading(false);setUploadPct(0);
+  }
+
+  async function generate(){
+    if(!text.trim())return setError("Please paste text or extract from a file.");
+    if(!title.trim())return setError("Please enter a quiz title.");
+    setError("");setLoading(true);setPreview(null);
+    try{const qs=await generateQuizFromText(text,qtype,count);if(!Array.isArray(qs)||!qs.length)throw new Error("Empty response");setPreview({title:title.trim(),questions:qs,quizType:qtype});}
+    catch(e){setError("Generation failed: "+e.message);}
+    setLoading(false);
+  }
+
+  async function savePaper(){
+    const paper={id:"p"+Date.now(),title:preview.title,questions:preview.questions,quizType:preview.quizType,assignedTo:[],createdAt:Date.now()};
+    await db.savePaper(paper);await reloadPapers();
+    setPreview(null);setText("");setTitle("");setFileName("");setPdfFile(null);
+    alert("✅ Paper saved! Go to 'All Papers' to assign it.");
+  }
+
+  return (
+    <div style={{padding:32,maxWidth:740}}>
+      <h2 style={{fontSize:20,fontWeight:700,color:"#111827",marginBottom:6,marginTop:0}}>Generate Quiz</h2>
+      <p style={{fontSize:13,color:"#9ca3af",marginBottom:22}}>Generate a quiz from text or a file. Specify page numbers for targeted extraction.</p>
+      <Card style={{marginBottom:20}}>
+        <div style={{marginBottom:14}}><label style={S.label}>Quiz Title *</label><input style={S.input} placeholder="e.g. Unit 3 Vocabulary" value={title} onChange={e=>setTitle(e.target.value)}/></div>
+        <div style={{marginBottom:14}}>
+          <label style={S.label}>Quiz Type</label>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            {types.map(t=><button key={t.id} onClick={()=>setQtype(t.id)} style={{padding:"8px 14px",borderRadius:8,border:`2px solid ${qtype===t.id?"#2563eb":"#e5e7eb"}`,background:qtype===t.id?"#eff6ff":"#fff",color:qtype===t.id?"#2563eb":"#374151",fontWeight:qtype===t.id?700:400,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>{t.icon} {t.label}</button>)}
+          </div>
+        </div>
+        <div style={{marginBottom:14}}><label style={S.label}>Lesson Text</label><textarea style={{...S.input,height:110,resize:"vertical"}} placeholder="Paste text here…" value={text} onChange={e=>setText(e.target.value)}/></div>
+        <div style={{marginBottom:14}}>
+          <label style={S.label}>Upload PDF or Image</label>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+            <input ref={fileRef} type="file" accept=".pdf,image/*" style={{display:"none"}} onChange={e=>setPdfFile(e.target.files[0]||null)}/>
+            <button onClick={()=>fileRef.current.click()} style={S.btn("gray")}>{pdfFile?`📄 ${pdfFile.name}`:"📎 Choose File"}</button>
+            <input style={{...S.input,width:180}} placeholder="Pages e.g. 1-3, 5" value={pageSpec} onChange={e=>setPageSpec(e.target.value)}/>
+            <button onClick={handleExtract} disabled={!pdfFile||fileLoading} style={{...S.btn("purple"),opacity:!pdfFile||fileLoading?.6:1}}>{fileLoading?<><Spinner/>Extracting…</>:"Extract Text"}</button>
+            <button onClick={uploadFile} disabled={!pdfFile||uploading} style={{...S.btn("orange"),opacity:!pdfFile||uploading?.6:1}}>{uploading?<><Spinner/>Uploading…</>:"☁ Upload to Cloud"}</button>
+          </div>
+          {uploading&&<ProgressBar pct={uploadPct} label="Uploading file"/>}
+          {fileName&&!fileLoading&&<p style={{fontSize:11,color:"#059669",marginTop:4}}>✓ {fileName} · {text.length} chars extracted</p>}
+          <p style={{fontSize:11,color:"#9ca3af",marginTop:4}}>Leave pages blank for full PDF. Large files (GBs) use ☁ Upload to Cloud.</p>
+        </div>
+        <div style={{marginBottom:18}}><label style={S.label}>Number of Questions</label>
+          <select style={{...S.input,width:"auto"}} value={count} onChange={e=>setCount(+e.target.value)}>
+            {[3,5,8,10,15,20].map(n=><option key={n} value={n}>{n}</option>)}
+          </select>
+        </div>
+        {error&&<Alert msg={error}/>}
+        <button onClick={generate} disabled={loading} style={{...S.btn("blue"),padding:"12px 28px",fontSize:14,opacity:loading?.65:1}}>{loading?<><Spinner/>Generating…</>:"✨ Generate Quiz"}</button>
+      </Card>
+      {preview&&(
+        <Card>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,flexWrap:"wrap",gap:10}}>
+            <div><h3 style={{margin:0,fontSize:16,fontWeight:700}}>{preview.title}</h3><p style={{margin:"3px 0 0",fontSize:12,color:"#9ca3af"}}>{preview.questions.length} questions</p></div>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={()=>downloadPDF(preview)} style={S.btn("gray")}>⬇ PDF</button>
+              <button onClick={()=>setPreview(null)} style={S.btn("gray")}>Discard</button>
+              <button onClick={savePaper} style={S.btn("green")}>💾 Save</button>
+            </div>
+          </div>
+          {preview.questions.map((q,i)=>(
+            <div key={i} style={{border:"1px solid #f3f4f6",borderRadius:10,padding:14,marginBottom:12}}>
+              <p style={{margin:"0 0 10px",fontWeight:700,fontSize:14}}>{i+1}. {q.question}</p>
+              {q.options.map((o,j)=><div key={j} style={{padding:"7px 12px",borderRadius:6,marginBottom:4,fontSize:13,background:o[0]===q.answer?"#d1fae5":"#f9fafb",color:o[0]===q.answer?"#065f46":"#374151",fontWeight:o[0]===q.answer?700:400}}>{o}{o[0]===q.answer?" ✓":""}</div>)}
+            </div>
+          ))}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ─── Papers Tab ───────────────────────────────────────────────────────────────
+function PapersTab({papers,students,attempts,reloadPapers}){
+  const [detailPaper,setDP]=useState(null);const [detailAttempt,setDA]=useState(null);
+  function isAllA(p){return p.assignedTo==="all"||(Array.isArray(p.assignedTo)&&p.assignedTo.includes("all"));}
+  function isA(p,sid){return isAllA(p)||(Array.isArray(p.assignedTo)&&p.assignedTo.includes(sid));}
+  async function toggleAll(paper){await db.savePaper({...paper,assignedTo:isAllA(paper)?[]:["all"]});await reloadPapers();}
+  async function toggleStudent(paper,sid){
+    if(isAllA(paper))return;
+    const cur=Array.isArray(paper.assignedTo)?paper.assignedTo.filter(x=>x!=="all"):[];
+    await db.savePaper({...paper,assignedTo:cur.includes(sid)?cur.filter(x=>x!==sid):[...cur,sid]});await reloadPapers();
+  }
+  return (
+    <div style={{padding:32}}>
+      <h2 style={{fontSize:20,fontWeight:700,color:"#111827",marginBottom:6,marginTop:0}}>All Papers</h2>
+      <p style={{fontSize:13,color:"#9ca3af",marginBottom:22}}>Manage and assign papers to students</p>
+      {papers.length===0?<Card style={{textAlign:"center",padding:56}}><div style={{fontSize:40,marginBottom:12}}>📄</div><p style={{color:"#9ca3af"}}>No papers yet.</p></Card>:(
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          {papers.map(paper=>{
+            const att=attempts.filter(a=>a.paperId===paper.id&&a.submitted);
+            const asg=students.filter(s=>isA(paper,s.id));
+            return (
+              <Card key={paper.id}>
+                <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:14}}>
+                  <div><h3 style={{margin:0,fontSize:15,fontWeight:700}}>{paper.title}</h3><p style={{margin:"4px 0 0",fontSize:12,color:"#9ca3af"}}>{paper.questions.length} questions · {new Date(paper.createdAt).toLocaleDateString()}</p></div>
+                  <div style={{display:"flex",gap:8}}>
+                    <button onClick={()=>setDP(paper)} style={S.btn("gray")}>👁 View</button>
+                    <button onClick={()=>downloadPDF(paper)} style={S.btn("gray")}>⬇ PDF</button>
+                    <button onClick={async()=>{if(!confirm("Delete?"))return;await db.deletePaper(paper.id);await reloadPapers();}} style={{...S.btn("gray"),color:"#dc2626"}}>Delete</button>
+                  </div>
+                </div>
+                <div style={{background:"#f9fafb",borderRadius:10,padding:12,marginBottom:12}}>
+                  <div style={{fontSize:11,fontWeight:700,color:"#374151",marginBottom:8,textTransform:"uppercase",letterSpacing:".4px"}}>Assign To</div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                    <button onClick={()=>toggleAll(paper)} style={{padding:"5px 12px",borderRadius:20,border:`2px solid ${isAllA(paper)?"#2563eb":"#e5e7eb"}`,background:isAllA(paper)?"#2563eb":"#fff",color:isAllA(paper)?"#fff":"#374151",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{isAllA(paper)?"✓ ":""}All</button>
+                    {students.map(s=><button key={s.id} onClick={()=>toggleStudent(paper,s.id)} style={{padding:"5px 12px",borderRadius:20,border:`2px solid ${isA(paper,s.id)?"#2563eb":"#e5e7eb"}`,background:isA(paper,s.id)?"#eff6ff":"#fff",color:isA(paper,s.id)?"#2563eb":"#374151",fontSize:12,fontWeight:isA(paper,s.id)?700:400,cursor:"pointer",fontFamily:"inherit"}}>{isA(paper,s.id)?"✓ ":""}{s.name}</button>)}
+                  </div>
+                </div>
+                <div style={{fontSize:11,fontWeight:700,color:"#374151",marginBottom:6,textTransform:"uppercase",letterSpacing:".4px"}}>Attempts ({att.length}/{asg.length})</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                  {asg.map(s=>{const a=att.find(a=>a.studentId===s.id);return(
+                    <button key={s.id} onClick={()=>a&&setDA({attempt:a,paper,student:s})} style={{padding:"6px 12px",borderRadius:8,border:`1.5px solid ${a?"#6ee7b7":"#e5e7eb"}`,background:a?"#ecfdf5":"#f9fafb",color:a?"#065f46":"#9ca3af",fontSize:12,cursor:a?"pointer":"default",fontFamily:"inherit",fontWeight:a?600:400}}>
+                      {s.name} {a?`✓ ${a.score}/${a.total}`:"⏳"}
+                    </button>
+                  );})}
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+      {detailPaper&&<Modal onClose={()=>setDP(null)}><div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}><h3 style={{margin:0}}>{detailPaper.title}</h3><div style={{display:"flex",gap:8}}><button onClick={()=>downloadPDF(detailPaper)} style={S.btn("blue")}>⬇ PDF</button><button onClick={()=>setDP(null)} style={S.btn("gray")}>Close</button></div></div><QList paper={detailPaper}/></Modal>}
+      {detailAttempt&&<Modal onClose={()=>setDA(null)}><div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}><div><h3 style={{margin:0}}>{detailAttempt.student.name}</h3><p style={{margin:"4px 0 0",fontSize:13,color:"#6b7280"}}>{detailAttempt.paper.title} · {detailAttempt.attempt.score}/{detailAttempt.attempt.total}</p></div><div style={{display:"flex",gap:8}}><button onClick={()=>downloadPDF(detailAttempt.paper,detailAttempt.student.name,detailAttempt.attempt)} style={S.btn("blue")}>⬇ PDF</button><button onClick={()=>setDA(null)} style={S.btn("gray")}>Close</button></div></div><RDetail paper={detailAttempt.paper} attempt={detailAttempt.attempt}/></Modal>}
+    </div>
+  );
+}
+
+function QList({paper}){return <div style={{display:"flex",flexDirection:"column",gap:12}}>{paper.questions.map((q,i)=><div key={i} style={{border:"1px solid #f3f4f6",borderRadius:10,padding:14}}><p style={{margin:"0 0 10px",fontWeight:700,fontSize:14}}>{i+1}. {q.question}</p>{q.options.map((o,j)=><div key={j} style={{padding:"7px 12px",borderRadius:6,marginBottom:4,fontSize:13,background:o[0]===q.answer?"#d1fae5":"#f9fafb",color:o[0]===q.answer?"#065f46":"#374151",fontWeight:o[0]===q.answer?700:400}}>{o}{o[0]===q.answer?" ✓":""}</div>)}</div>)}</div>;}
+function RDetail({paper,attempt}){return <div style={{display:"flex",flexDirection:"column",gap:12}}>{paper.questions.map((q,i)=>{const ch=attempt.answers?.[i],co=q.answer;return <div key={i} style={{border:"1px solid #f3f4f6",borderRadius:10,padding:14}}><p style={{margin:"0 0 10px",fontWeight:700,fontSize:14}}>{i+1}. {q.question}</p>{q.options.map((o,j)=>{const l=o[0],isC=l===co,isCh=l===ch;let bg="#f9fafb",col="#374151",fw=400;if(isC){bg="#d1fae5";col="#065f46";fw=700;}else if(isCh&&!isC){bg="#fee2e2";col="#991b1b";fw=700;}const tag=isCh&&isC?"✓ Correct":isCh?"✗ Wrong":isC?"← Answer":"";return <div key={j} style={{padding:"7px 12px",borderRadius:6,marginBottom:4,fontSize:13,background:bg,color:col,fontWeight:fw,display:"flex",justifyContent:"space-between"}}><span>{o}</span><span style={{fontSize:11,opacity:.8}}>{tag}</span></div>;})}</div>;})} </div>;}
+
+// ─── Students Tab ─────────────────────────────────────────────────────────────
+function StudentsTab({students,reloadStudents,attempts}){
+  const [name,setName]=useState("");const [uname,setUname]=useState("");const [pass,setPass]=useState("");const [email,setEmail]=useState("");const [err,setErr]=useState("");
+  async function add(){
+    setErr("");
+    if(!name.trim()||!uname.trim()||!pass.trim())return setErr("Name, username, password required.");
+    if(students.find(s=>s.username===uname.trim()))return setErr("Username taken.");
+    await db.saveStudent({id:"s"+Date.now(),name:name.trim(),username:uname.trim(),password:pass.trim(),email:email.trim()});
+    await reloadStudents();setName("");setUname("");setPass("");setEmail("");
+  }
+  async function del(id){if(!confirm("Delete student?"))return;await db.deleteStudent(id);await reloadStudents();}
+  return (
+    <div style={{padding:32,maxWidth:700}}>
+      <h2 style={{fontSize:20,fontWeight:700,color:"#111827",marginBottom:20,marginTop:0}}>Students</h2>
+      <Card style={{marginBottom:20}}>
+        <h3 style={{margin:"0 0 14px",fontSize:14,fontWeight:600}}>Add New Student</h3>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          <div><label style={S.label}>Full Name *</label><input style={S.input} value={name} onChange={e=>setName(e.target.value)}/></div>
+          <div><label style={S.label}>Username *</label><input style={S.input} value={uname} onChange={e=>setUname(e.target.value)}/></div>
+          <div><label style={S.label}>Password *</label><input style={S.input} value={pass} onChange={e=>setPass(e.target.value)}/></div>
+          <div><label style={S.label}>Email</label><input style={S.input} value={email} onChange={e=>setEmail(e.target.value)}/></div>
+        </div>
+        {err&&<Alert msg={err}/>}
+        <button onClick={add} style={S.btn("blue")}>+ Add Student</button>
+      </Card>
+      <Card>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+          <thead><tr style={{color:"#9ca3af",fontSize:11,borderBottom:"2px solid #f3f4f6"}}>
+            {["Name","Username","Password","Attempts",""].map(h=><th key={h} style={{textAlign:"left",paddingBottom:10,fontWeight:600,textTransform:"uppercase",letterSpacing:".4px"}}>{h}</th>)}
+          </tr></thead>
+          <tbody>{students.map(s=>{
+            const att=attempts.filter(a=>a.studentId===s.id&&a.submitted).length;
+            return <tr key={s.id} style={{borderTop:"1px solid #f3f4f6"}}>
+              <td style={{padding:"11px 0",fontWeight:600}}>{s.name}</td>
+              <td style={{color:"#6b7280"}}>{s.username}</td>
+              <td style={{color:"#6b7280",fontFamily:"monospace",fontSize:12}}>{s.password}</td>
+              <td style={{color:"#6b7280"}}>{att}</td>
+              <td><button onClick={()=>del(s.id)} style={{...S.btn("gray"),color:"#dc2626",padding:"4px 10px",fontSize:12}}>Delete</button></td>
+            </tr>;
+          })}</tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+// ─── Results Tab ──────────────────────────────────────────────────────────────
+function ResultsTab({students,papers,attempts}){
+  const [filter,setFilter]=useState("all");
+  const filtered=attempts.filter(a=>a.submitted&&(filter==="all"||a.studentId===filter));
+  function exportCSV(){
+    const h="Student,Paper,Score,Total,Percentage,Date\n";
+    const b=filtered.map(a=>{const st=students.find(s=>s.id===a.studentId),p=papers.find(p=>p.id===a.paperId);return `"${st?.name}","${p?.title}",${a.score},${a.total},${Math.round(a.score/a.total*100)}%,"${new Date(a.submittedAt).toLocaleDateString()}"`;}).join("\n");
+    const blob=new Blob([h+b],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="results.csv";a.click();
+  }
+  return (
+    <div style={{padding:32}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:22}}>
+        <h2 style={{fontSize:20,fontWeight:700,color:"#111827",margin:0}}>Results</h2>
+        <div style={{display:"flex",gap:10}}>
+          <select style={{...S.input,width:"auto",fontSize:13}} value={filter} onChange={e=>setFilter(e.target.value)}>
+            <option value="all">All Students</option>
+            {students.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+          <button onClick={exportCSV} style={S.btn("blue")}>⬇ Export CSV</button>
+        </div>
+      </div>
+      <Card>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+          <thead><tr style={{color:"#9ca3af",fontSize:11,borderBottom:"2px solid #f3f4f6"}}>
+            {["Student","Paper","Score","%","Date"].map(h=><th key={h} style={{textAlign:"left",paddingBottom:10,fontWeight:600,textTransform:"uppercase",letterSpacing:".4px"}}>{h}</th>)}
+          </tr></thead>
+          <tbody>{filtered.length===0?<tr><td colSpan={5} style={{padding:"36px 0",textAlign:"center",color:"#9ca3af"}}>No results yet.</td></tr>:
+            filtered.map(a=>{const st=students.find(s=>s.id===a.studentId),p=papers.find(p=>p.id===a.paperId),pct=Math.round(a.score/a.total*100);
+              return <tr key={a.id} style={{borderTop:"1px solid #f3f4f6"}}><td style={{padding:"11px 0",fontWeight:600}}>{st?.name}</td><td style={{color:"#6b7280"}}>{p?.title}</td><td>{a.score}/{a.total}</td><td><Pct val={pct}/></td><td style={{color:"#9ca3af"}}>{new Date(a.submittedAt).toLocaleDateString()}</td></tr>;
+            })}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+// ─── Student App ──────────────────────────────────────────────────────────────
+function StudentApp({user,papers,attempts,weeks,onLogout,reloadAttempts,refresh}){
+  const [tab,setTab]=useState("course");const [activePaper,setAP]=useState(null);
+  useEffect(()=>{refresh();},[]);
+  const now=new Date();
+  const pubWeeks=[...weeks].filter(w=>w.status==="published"||(w.status==="scheduled"&&new Date(w.publishDate)<=now)).sort((a,b)=>a.weekNum-b.weekNum);
+  const myPapers=papers.filter(p=>{if(p.assignedTo==="all")return true;if(Array.isArray(p.assignedTo))return p.assignedTo.includes("all")||p.assignedTo.includes(user.id);return false;});
+  const myAttempts=attempts.filter(a=>a.studentId===user.id&&a.submitted);
+
+  async function submit(paper,answers){
+    const score=paper.questions.filter((q,i)=>answers[i]===q.answer).length;
+    await db.saveAttempt({id:"a"+Date.now(),studentId:user.id,paperId:paper.id,answers,score,total:paper.questions.length,submitted:true,submittedAt:Date.now()});
+    await reloadAttempts();setAP(null);setTab("results");
+  }
+
+  if(activePaper)return <TakeQuiz paper={activePaper} onSubmit={ans=>submit(activePaper,ans)} onBack={()=>setAP(null)}/>;
+  const tabs=[{id:"course",label:"Course",icon:"📅"},{id:"quizzes",label:"My Quizzes",icon:"📄"},{id:"results",label:"My Results",icon:"📈"}];
+
+  return (
+    <div style={{display:"flex",minHeight:"100vh",background:"#f8fafc"}}>
+      <Sidebar tabs={tabs} active={tab} onSelect={setTab} role="student" onLogout={onLogout} onRefresh={refresh}/>
+      <div style={{flex:1,padding:32}}>
+        {tab==="course"&&(
+          <>
+            <h2 style={{fontSize:20,fontWeight:700,color:"#111827",marginBottom:6,marginTop:0}}>Course Material</h2>
+            <p style={{fontSize:13,color:"#9ca3af",marginBottom:22}}>Weekly reading passages and vocabulary — new material added as the course progresses</p>
+            {pubWeeks.length===0?<Card style={{textAlign:"center",padding:56}}><div style={{fontSize:36,marginBottom:10}}>📅</div><p style={{color:"#9ca3af"}}>No material published yet. Check back soon!</p></Card>:
+              <div style={{display:"flex",flexDirection:"column",gap:20,maxWidth:760}}>
+                {pubWeeks.map(week=>{
+                  const lp=papers.find(p=>p.id===week.paperId&&myPapers.find(mp=>mp.id===p.id));
+                  const done=lp&&myAttempts.find(a=>a.paperId===lp.id);
+                  return (
+                    <Card key={week.id}>
+                      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+                        <span style={{background:"#2563eb",color:"#fff",fontSize:11,fontWeight:700,padding:"3px 10px",borderRadius:20}}>WEEK {week.weekNum}</span>
+                        <h3 style={{margin:0,fontSize:16,fontWeight:700,color:"#111827"}}>{week.title}</h3>
+                      </div>
+                      {week.passage&&<div style={{marginBottom:16}}>
+                        <div style={{fontSize:12,fontWeight:700,color:"#374151",marginBottom:8,textTransform:"uppercase",letterSpacing:".4px"}}>Reading Passage</div>
+                        <div style={{background:"#f8fafc",border:"1px solid #e5e7eb",borderRadius:10,padding:16,fontSize:14,color:"#374151",lineHeight:1.9,maxHeight:220,overflowY:"auto",whiteSpace:"pre-wrap"}}>{week.passage}</div>
+                      </div>}
+                      {week.keywords?.length>0&&<div style={{marginBottom:16}}>
+                        <div style={{fontSize:12,fontWeight:700,color:"#374151",marginBottom:8,textTransform:"uppercase",letterSpacing:".4px"}}>Key Vocabulary ({week.keywords.length} words)</div>
+                        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:8}}>
+                          {week.keywords.map((kw,i)=><div key={i} style={{background:"#eff6ff",borderRadius:8,padding:"8px 12px"}}>
+                            <div style={{fontWeight:700,color:"#2563eb",fontSize:13}}>{kw.word} <span style={{fontSize:10,color:"#93c5fd",fontWeight:400}}>({kw.partOfSpeech})</span></div>
+                            <div style={{fontSize:12,color:"#374151",marginTop:2}}>{kw.definition}</div>
+                          </div>)}
+                        </div>
+                      </div>}
+                      {lp&&<div style={{background:"#f9fafb",borderRadius:10,padding:12,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                        <span style={{fontSize:13,fontWeight:600,color:"#374151"}}>📝 Vocabulary Quiz</span>
+                        {done?<span style={{fontSize:12,background:"#d1fae5",color:"#065f46",padding:"5px 14px",borderRadius:20,fontWeight:700}}>Done ✓ {done.score}/{done.total}</span>
+                          :<button onClick={()=>setAP(lp)} style={{...S.btn("blue"),padding:"8px 18px"}}>Start Quiz →</button>}
+                      </div>}
+                    </Card>
+                  );
+                })}
+              </div>
+            }
+          </>
+        )}
+        {tab==="quizzes"&&(
+          <>
+            <h2 style={{fontSize:20,fontWeight:700,color:"#111827",marginBottom:22,marginTop:0}}>My Quizzes</h2>
+            {myPapers.length===0?<Card style={{textAlign:"center",padding:56}}><p style={{color:"#9ca3af"}}>No quizzes assigned yet.</p></Card>:(
+              <div style={{display:"flex",flexDirection:"column",gap:12,maxWidth:620}}>
+                {myPapers.map(p=>{const done=myAttempts.find(a=>a.paperId===p.id);return(
+                  <Card key={p.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"18px 24px"}}>
+                    <div><h3 style={{margin:0,fontSize:15,fontWeight:700}}>{p.title}</h3><p style={{margin:"4px 0 0",fontSize:12,color:"#9ca3af"}}>{p.questions.length} questions</p>
+                      {done&&<p style={{margin:"4px 0 0",fontSize:12,color:"#059669",fontWeight:600}}>✓ {done.score}/{done.total} ({Math.round(done.score/done.total*100)}%)</p>}
+                    </div>
+                    {done?<span style={{fontSize:12,background:"#d1fae5",color:"#065f46",padding:"5px 14px",borderRadius:20,fontWeight:700}}>Done ✓</span>
+                      :<button onClick={()=>setAP(p)} style={{...S.btn("blue"),padding:"10px 20px"}}>Start →</button>}
+                  </Card>
+                );})}
+              </div>
+            )}
+          </>
+        )}
+        {tab==="results"&&(
+          <>
+            <h2 style={{fontSize:20,fontWeight:700,color:"#111827",marginBottom:22,marginTop:0}}>My Results</h2>
+            {myAttempts.length===0?<Card style={{textAlign:"center",padding:56}}><p style={{color:"#9ca3af"}}>No completed quizzes yet.</p></Card>:(
+              <div style={{display:"flex",flexDirection:"column",gap:16,maxWidth:660}}>
+                {myAttempts.map(att=>{const p=papers.find(p=>p.id===att.paperId);if(!p)return null;const pct=Math.round(att.score/att.total*100);
+                  return <Card key={att.id}>
+                    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+                      <div><h3 style={{margin:0,fontSize:15,fontWeight:700}}>{p.title}</h3><p style={{margin:"4px 0 0",fontSize:12,color:"#9ca3af"}}>{new Date(att.submittedAt).toLocaleDateString()}</p></div>
+                      <div style={{display:"flex",alignItems:"center",gap:12}}>
+                        <span style={{fontSize:22,fontWeight:700,color:pct>=70?"#059669":pct>=50?"#d97706":"#dc2626"}}>{pct}%</span>
+                        <button onClick={()=>downloadPDF(p,user.name,att)} style={{...S.btn("blue"),padding:"7px 14px",fontSize:12}}>⬇ PDF</button>
+                      </div>
+                    </div>
+                    <RDetail paper={p} attempt={att}/>
+                  </Card>;
+                })}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Take Quiz ────────────────────────────────────────────────────────────────
+function TakeQuiz({paper,onSubmit,onBack}){
+  const [answers,setA]=useState({});const [confirm,setC]=useState(false);
+  const done=Object.keys(answers).length,pct=Math.round(done/paper.questions.length*100);
+  return (
+    <div style={{minHeight:"100vh",background:"#f8fafc"}}>
+      <div style={{background:"#1e3a8a",color:"#fff",padding:"14px 32px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <button onClick={onBack} style={{...S.btn("gray"),background:"rgba(255,255,255,0.15)",color:"#fff",border:"none"}}>← Back</button>
+          <span style={{fontWeight:700,fontSize:15}}>{paper.title}</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <span style={{fontSize:13,opacity:.8}}>{done}/{paper.questions.length}</span>
+          <div style={{background:"rgba(255,255,255,0.2)",borderRadius:20,height:8,width:140}}>
+            <div style={{background:"#34d399",borderRadius:20,height:8,width:`${pct}%`,transition:"width .3s"}}/>
+          </div>
+        </div>
+      </div>
+      <div style={{maxWidth:640,margin:"0 auto",padding:32}}>
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          {paper.questions.map((q,i)=>(
+            <Card key={i} style={{border:answers[i]?"1px solid #bfdbfe":"1px solid #e5e7eb"}}>
+              <p style={{margin:"0 0 12px",fontWeight:700,fontSize:14,color:"#111827",lineHeight:1.6}}>Q{i+1}. {q.question}</p>
+              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {q.options.map((o,j)=>{const sel=answers[i]===o[0];
+                  return <button key={j} onClick={()=>setA({...answers,[i]:o[0]})} style={{textAlign:"left",padding:"10px 14px",borderRadius:8,border:`2px solid ${sel?"#2563eb":"#e5e7eb"}`,background:sel?"#eff6ff":"#fff",color:sel?"#1d4ed8":"#374151",fontSize:13,cursor:"pointer",fontWeight:sel?700:400,transition:"all .15s",fontFamily:"inherit"}}>{o}</button>;})}
+            </Card>
+          ))}
+        </div>
+        <button onClick={()=>{if(done<paper.questions.length)return alert(`Please answer all questions. (${paper.questions.length-done} remaining)`);setC(true);}} style={{...S.btn("blue"),width:"100%",padding:"14px 0",fontSize:15,marginTop:20,opacity:done===paper.questions.length?1:.6}}>
+          Submit Quiz ({done}/{paper.questions.length})
+        </button>
+      </div>
+      {confirm&&<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:50}}>
+        <div style={{background:"#fff",borderRadius:18,padding:40,maxWidth:340,width:"100%",textAlign:"center",boxShadow:"0 25px 50px rgba(0,0,0,0.2)"}}>
+          <div style={{fontSize:44,marginBottom:10}}>📝</div>
+          <h3 style={{margin:"0 0 8px",fontSize:18}}>Submit Quiz?</h3>
+          <p style={{color:"#9ca3af",fontSize:13,marginBottom:24}}>You cannot change answers after submitting.</p>
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>setC(false)} style={{...S.btn("gray"),flex:1,padding:"12px 0"}}>Cancel</button>
+            <button onClick={()=>onSubmit(answers)} style={{...S.btn("blue"),flex:1,padding:"12px 0"}}>Submit ✓</button>
+          </div>
+        </div>
+      </div>}
+    </div>
+  );
+}
+
+// ─── Inject spin animation & mount ───────────────────────────────────────────
+const style=document.createElement("style");
+style.textContent="@keyframes spin{to{transform:rotate(360deg)}}";
+document.head.appendChild(style);
+ReactDOM.render(<App/>,document.getElementById("root"));
+</script>
+</body>
+</html>
