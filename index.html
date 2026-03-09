@@ -4,10 +4,10 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>English Quiz App</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{font-family:system-ui,-apple-system,sans-serif;background:#f8fafc}
@@ -24,7 +24,7 @@
 // ─── CONFIG — Replace these with your actual keys ─────────────────────────────
 const SUPABASE_URL     = "https://caoemavwgpipqbfccuhh.supabase.co";
 const SUPABASE_ANON_KEY= "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNhb2VtYXZ3Z3BpcHFiZmNjdWhoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjAyNDgsImV4cCI6MjA4ODYzNjI0OH0.noF4r0ZrAUGPVZeRLcDzcNJj4ECr-f-js2XWwEggLa4";
-const GEMINI_KEY       = "AIzaSyDWW2bGe62bvfC8dsg79Wzt_Q8UU9IPrIs";  // Free at aistudio.google.com
+const GEMINI_KEY       = "AIzaSyDWW2bGe62bvfC8dsg79Wzt_Q8UU9IPrIs";
 
 // ─── Supabase client ──────────────────────────────────────────────────────────
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -106,12 +106,14 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemi
 async function callGemini(parts, maxTokens=3000) {
   const res = await fetch(GEMINI_URL, {
     method:"POST",
+    mode:"cors",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({
       contents:[{parts}],
       generationConfig:{maxOutputTokens:maxTokens,temperature:0.7}
     })
   });
+  if(!res.ok) { const e=await res.json(); throw new Error(e.error?.message||`HTTP ${res.status}`); }
   const data = await res.json();
   if(data.error) throw new Error(data.error.message);
   return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
